@@ -1,0 +1,18 @@
+# macOS Finder metadata
+.DS_Store
+
+# Arduino build/upload output
+*.elf
+*.hex
+*.bin
+*.map
+*.partitions.bin
+*.bootloader.bin
+
+# Arduino IDE temporary files
+*.tmp
+*.bak
+*~
+
+# PlatformIO build output, if used later
+.pio/
