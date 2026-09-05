@@ -12,7 +12,7 @@
 // IR Cloner - stable single-file Cardputer build
 // Libraries: M5Cardputer, IRremote
 // TX/RX pins are configurable at runtime from the SETTINGS screen (persisted in NVS)
-// Keys: ;=up  .=down  ,=left  /=right  Enter=select  `=back  S=save  R=replay  X=delete file
+// Keys: ;=up  .=down  ,=left  /=right  Enter=select  `=back  S=save  R=replay  D=delete file
 
 constexpr uint8_t DEFAULT_IR_TX_PIN = 44;
 constexpr uint8_t DEFAULT_IR_RX_PIN = 1;
@@ -845,7 +845,7 @@ void drawScrollingRemoteTitle(const String &title) {
 void drawScreen() {
   if (screen == HOME) {
     const String items[] = { "CAPTURE REMOTE", "REMOTES", "SPAM SIGNALS", "SETTINGS", "SYSTEM", "ABOUT" };
-    drawList("IR CLONER", items, 6, menu, "[ENTER] SELECT [ESC] BACK");
+    drawList("IR CLONER", items, 6, menu, "[ENTER] Select [ESC] Back");
   }
 
   else if (screen == CAPTURE_REMOTE) {
@@ -864,7 +864,7 @@ void drawScreen() {
     String items[5];
     uint8_t shown = min(workRemote.count, (uint8_t)5);
     for (uint8_t i = 0; i < shown; ++i) items[i] = String(i + 1) + ". " + workRemote.signals[i].name;
-    drawList("REVIEW REMOTE", items, shown, selected, "[ENTER] NAME [R] REPLAY [S] SAVE");
+    drawList("REVIEW REMOTE", items, shown, selected, "[ENTER] NameE [R] Replay [S] Save");
   }
 
   else if (screen == EDIT_BUTTON || screen == EDIT_REMOTE) {
@@ -883,7 +883,7 @@ void drawScreen() {
       String("LITTLEFS") + (littlefsOK ? "" : " (NOT READY)")
     };
     drawList(screen == SAVE_WHERE ? "SAVE LOCATION" : "LOAD LOCATION", items, 2, menu,
-             "[ENTER] SELECT [ESC] BACK");
+             "[ENTER] Select [ESC] Back");
   }
 
   else if (screen == BROWSER || screen == SPAM_BROWSER) {
