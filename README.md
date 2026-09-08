@@ -99,27 +99,6 @@ Example filename:
 /ircloner/TV_REMOTE.ir
 ```
 
-## Project structure
-
-```text
-.
-├── include/
-│   ├── core/
-│   ├── ir/
-│   ├── remote/
-│   └── splash/
-├── lib/
-├── src/
-│   ├── core/
-│   ├── ir/
-│   ├── remote/
-│   ├── splash/
-│   └── main.cpp
-├── media/
-│   └── images/
-└── README.md
-```
-
 ## Controls
 
 | Key | Action |
