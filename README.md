@@ -135,6 +135,9 @@ When reporting an issue, include:
 ## Credits
 
 [Bruce](https://bruce.computer/)
+
 [UniGeek](https://unigeek.xid.run/)
+
 [Juj](https://github.com/juj) for [image to rgb565 generation](https://github.com/juj/ST7735R/blob/master/image_to_rgb565.py)
+
 Claude and Perplextity AI Tools
