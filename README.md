@@ -42,7 +42,7 @@ You can change the TX and RX pins from the app's Settings screen.
 
 ## Screenshots
 
-![Splash screen](media/images/Splash%202.jpg)
+![Splash screen](/media/images/splash%202.jpg)
 
 ![Menu screen](media/images/Frame%204.jpg)
 
