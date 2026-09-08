@@ -1,0 +1,20 @@
+# Arduino build products and temporary files
+build/
+release/
+*.elf
+*.map
+
+# macOS Finder metadata
+.DS_Store
+
+# Editor settings
+.vscode/
+.idea/
+
+# Temporary backup files
+*.bak
+*.tmp
+*~
+
+# Do not commit experimental PlatformIO refactor output
+.pio/
