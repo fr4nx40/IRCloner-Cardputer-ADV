@@ -42,11 +42,14 @@ You can change the TX and RX pins from the app's Settings screen.
 
 ## Screenshots
 
-![Home screen](docs/images/home-screen.png)
+![Splash screen](media/images/plash%202.jpg)
 
-![Remote grid](docs/images/remote-grid.png)
+![Menu screen](media/images/Frame%204.jpg)
 
-![Settings screen](docs/images/settings-screen.png)
+![Remote screen](media/images/Frame%205.jpg)
+
+![Settings screen](media/images/Frame%203.jpg)
+
 
 ## Wiring
 
