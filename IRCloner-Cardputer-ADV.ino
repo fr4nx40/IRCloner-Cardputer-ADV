@@ -7,47 +7,13 @@
 #include <math.h>
 #include <algorithm>
 #include <vector>
+#include "config.h"
 #include "splash_sprite.h"
 
 // IR Cloner - stable single-file Cardputer build
 // Libraries: M5Cardputer, IRremote
 // TX/RX pins are configurable at runtime from the SETTINGS screen (persisted in NVS)
 // Keys: ;=up  .=down  ,=left  /=right  Enter=select  `=back  S=save  R=replay  D=delete file
-
-constexpr uint8_t DEFAULT_IR_TX_PIN = 44;
-constexpr uint8_t DEFAULT_IR_RX_PIN = 1;
-constexpr uint8_t MAX_GPIO = 48;  // ESP32-S3 highest usable GPIO number
-constexpr uint8_t MAX_SIGNALS = 64;
-constexpr uint8_t GRID_COLUMNS = 4;
-constexpr uint8_t GRID_ROWS = 3;
-constexpr uint8_t GRID_PAGE_SIZE = GRID_COLUMNS * GRID_ROWS;
-uint8_t browserTop = 0;
-uint32_t remoteTitleAt = 0;
-uint16_t remoteTitleOffset = 0;
-int8_t remoteTitleDirection = 1;
-constexpr char BACK_KEY = '`';
-constexpr char DELETE_KEY = 'd';
-constexpr uint32_t CAPTURE_DEBOUNCE_MS = 450;
-const char *IR_DIR = "/ircloner";
-
-// Screen timeout choices in seconds; index 0 (0s) means "never dim"
-constexpr uint16_t DIM_CHOICES[] = { 0, 15, 30, 60, 120, 300 };
-constexpr uint8_t DIM_CHOICE_COUNT = sizeof(DIM_CHOICES) / sizeof(DIM_CHOICES[0]);
-constexpr uint8_t MIN_BRIGHTNESS = 10;
-constexpr uint8_t MAX_BRIGHTNESS = 255;
-constexpr uint8_t BRIGHTNESS_STEP = 15;
-constexpr uint32_t RAW_SEND_SPLIT_US = 60000;         // IRremote's raw buffer entries are uint16_t (<=65535us)
-const char *CONFIG_PATH = "/IRCloner/config.config";  // JSON settings file at the root of the SD card
-const char *APP_VERSION = "v1.0";
-
-constexpr uint16_t UI_BG = 0x0841;
-constexpr uint16_t UI_PINK = 0xF1B5;
-constexpr uint16_t UI_CYAN = 0x07FF;
-constexpr uint16_t UI_YELLOW = 0xFFE0;
-constexpr uint16_t UI_WHITE = 0xFFFF;
-constexpr uint16_t UI_DIM = 0x4A49;
-constexpr uint16_t UI_RED = 0xF800;
-constexpr uint16_t UI_GREEN = 0x07E0;
 
 
 enum Screen : uint8_t {
@@ -693,7 +659,7 @@ void header(const String &title) {
   canvas.setTextDatum(top_center);
   canvas.setTextSize(2);
   canvas.setTextColor(UI_PINK, UI_BG);
-  canvas.drawString(title, 120, 7);
+  canvas.drawString(title, 120, 10);
   canvas.drawFastHLine(6, 32, 228, UI_YELLOW);
   canvas.setTextDatum(top_left);
   canvas.setTextSize(1);
@@ -795,57 +761,11 @@ void keepBrowserSelectionVisible() {
     browserTop = maxTop;
   }
 }
-void drawScrollingRemoteTitle(const String &title) {
-  constexpr int TITLE_Y = 7;
-  constexpr int TITLE_LEFT = 8;
-  constexpr int TITLE_RIGHT = 232;
-  constexpr int TITLE_WIDTH = TITLE_RIGHT - TITLE_LEFT;
-
-  canvas.fillRect(0, 0, 240, 31, UI_BG);
-
-  canvas.setTextSize(2);
-  canvas.setTextColor(UI_PINK, UI_BG);
-
-  int textWidth = canvas.textWidth(title);
-
-  // Short titles behave exactly like the current centred title.
-  if (textWidth <= TITLE_WIDTH) {
-    canvas.setTextDatum(top_center);
-    canvas.drawString(title, 120, TITLE_Y);
-    canvas.setTextDatum(top_left);
-    return;
-  }
-
-  // Long title: draw left-to-right as a marquee inside the header area.
-  uint32_t now = millis();
-  if (now - remoteTitleAt >= 55) {
-    remoteTitleAt = now;
-
-    int maxOffset = textWidth - TITLE_WIDTH;
-
-    if (remoteTitleDirection > 0) {
-      if (remoteTitleOffset < maxOffset) {
-        ++remoteTitleOffset;
-      } else {
-        remoteTitleDirection = -1;
-      }
-    } else {
-      if (remoteTitleOffset > 0) {
-        --remoteTitleOffset;
-      } else {
-        remoteTitleDirection = 1;
-      }
-    }
-  }
-
-  canvas.setTextDatum(top_left);
-  canvas.drawString(title, TITLE_LEFT - remoteTitleOffset, TITLE_Y);
-}
 
 void drawScreen() {
   if (screen == HOME) {
     const String items[] = { "CAPTURE REMOTE", "REMOTES", "SPAM SIGNALS", "SETTINGS", "SYSTEM", "ABOUT" };
-    drawList("IR CLONER", items, 6, menu, "[ENTER] Select [ESC] Back");
+    drawList("IR CLONER", items, 6, menu, "[ENTER] Select");
   }
 
   else if (screen == CAPTURE_REMOTE) {
@@ -864,7 +784,7 @@ void drawScreen() {
     String items[5];
     uint8_t shown = min(workRemote.count, (uint8_t)5);
     for (uint8_t i = 0; i < shown; ++i) items[i] = String(i + 1) + ". " + workRemote.signals[i].name;
-    drawList("REVIEW REMOTE", items, shown, selected, "[ENTER] NameE [R] Replay [S] Save");
+    drawList("REVIEW REMOTE", items, shown, selected, "[ENTER] Name [R] Replay [S] Save");
   }
 
   else if (screen == EDIT_BUTTON || screen == EDIT_REMOTE) {
@@ -874,7 +794,7 @@ void drawScreen() {
     canvas.drawRoundRect(10, 63, 220, 22, 2, UI_CYAN);
     canvas.setTextColor(UI_YELLOW, UI_BG);
     canvas.drawString("> " + editText + "_", 16, 70);
-    footer("[ENTER] Confirm [ESC] Cancel [DEL] Delete");
+    footer("[ENTER] Confirm [ESC] Cancel");
   }
 
   else if (screen == SAVE_WHERE || screen == LOAD_WHERE) {
@@ -948,8 +868,7 @@ void drawScreen() {
   }
 
   else if (screen == REMOTE_GRID) {
-    header("");
-    drawScrollingRemoteTitle(loadedRemote.name);
+    header(loadedRemote.name);
     canvas.drawFastHLine(6, 32, 228, UI_YELLOW);
 
     // Important: the scrolling title uses text size 2.
@@ -1189,38 +1108,38 @@ void drawScreen() {
     header("SYSTEM");
     canvas.setTextColor(UI_WHITE, UI_BG);
 
-    canvas.drawString("SD CARD", 31, 38);
+    canvas.drawString("SD CARD", 31, 48);
     canvas.setTextColor(sdOK ? UI_GREEN : UI_RED, UI_BG);
     canvas.setTextDatum(top_right);
-    canvas.drawString(sdOK ? "MOUNTED" : "NOT MOUNTED", 225, 38);
+    canvas.drawString(sdOK ? "MOUNTED" : "NOT MOUNTED", 225, 48);
 
     canvas.setTextDatum(top_left);
     canvas.setTextColor(UI_WHITE, UI_BG);
-    canvas.drawString("IR MODULE", 31, 57);
+    canvas.drawString("IR MODULE", 31, 63);
     canvas.setTextColor(irModuleOK ? UI_GREEN : UI_RED, UI_BG);
     canvas.setTextDatum(top_right);
-    canvas.drawString(irTestActive ? "TESTING..." : (irModuleOK ? "CONNECTED" : "NOT CONNECTED"), 225, 57);
+    canvas.drawString(irTestActive ? "TESTING..." : (irModuleOK ? "CONNECTED" : "NOT CONNECTED"), 225, 63);
     canvas.setTextDatum(top_left);
     canvas.setTextColor(UI_WHITE, UI_BG);
-    canvas.drawString("BATTERY", 31, 76);
+    canvas.drawString("BATTERY", 31, 78);
     canvas.setTextDatum(top_right);
     canvas.setTextColor(UI_YELLOW, UI_BG);
-    canvas.drawString(String(M5Cardputer.Power.getBatteryLevel()) + "%", 225, 76);
+    canvas.drawString(String(M5Cardputer.Power.getBatteryLevel()) + "%", 225, 78);
     canvas.setTextDatum(top_left);
-    canvas.drawString("VERSION", 31, 95);
+    canvas.drawString("VERSION", 31, 93);
     canvas.setTextDatum(top_right);
     canvas.setTextColor(UI_YELLOW, UI_BG);
-    canvas.drawString(APP_VERSION, 225, 95);
+    canvas.drawString(APP_VERSION, 225, 93);
     canvas.setTextDatum(top_left);
-    footer(irTestActive ? "POINT TX AT RX..." : "[ENTER] Test IR  [ESC] Back");
+    footer(irTestActive ? "Connect IR Module" : "[ENTER] Test IR  [ESC] Back");
   }
 
 
    else if (screen == ABOUT) {
     header("ABOUT");
-    centered("IR CLONER", 41, UI_YELLOW, 2);
+    centered("IR CLONER", 40, UI_YELLOW, 2);
     centered("Created by Fr4nx40", 65, UI_WHITE);
-    centered(APP_VERSION, 76, UI_GREEN);
+    centered(APP_VERSION, 80, UI_GREEN);
     footer("[ESC] Back");
   }
 
@@ -1452,9 +1371,6 @@ bool handleInput() {
           screen = SPAM_SETUP;
         } else {
           gridIndex = 0;
-          remoteTitleOffset = 0;
-          remoteTitleDirection = 1;
-          remoteTitleAt = millis();
           screen = REMOTE_GRID;
         }
         syncKeys();
@@ -1541,33 +1457,40 @@ bool handleInput() {
       redraw = true;
     }
 
+    // Handle left/right changes (leftPressed/rightPressed already do edge detection)
     bool left = leftPressed();
     bool right = rightPressed();
 
     if (left || right) {
+      const bool isRight = right;
+
       if (menu == 0) {
         // SEND: target
-        if (right) {
+        if (isRight) {
           spamTarget = spamTarget >= loadedRemote.count ? 0 : spamTarget + 1;
         } else {
           spamTarget = spamTarget == 0 ? loadedRemote.count : spamTarget - 1;
         }
         redraw = true;
+
       } else if (menu == 1) {
         // MODE
         spamContinuous = !spamContinuous;
         redraw = true;
+
       } else if (menu == 2) {
         // COUNT (only when not continuous)
         if (!spamContinuous) {
-          spamLimit = constrain((int)spamLimit + (right ? 10 : -10), 1, 9999);
+          spamLimit = constrain((int)spamLimit + (isRight ? 10 : -10), 1, 9999);
           redraw = true;
         }
+
       } else if (menu == 3) {
         // DELAY
-        spamDelay = constrain((int)spamDelay + (right ? 10 : -10), 20, 5000);
+        spamDelay = constrain((int)spamDelay + (isRight ? 10 : -10), 20, 5000);
         redraw = true;
       }
+
       // menu == 4 is "START SENDING" – no left/right change
     }
 
@@ -1645,6 +1568,16 @@ bool handleInput() {
   }
 
   else if (screen == SETTINGS) {
+    // Exit settings: save once, then go home
+    if (back || enterPressed()) {
+      saveSettings();
+      applyPins();
+      screen = HOME;   
+      syncKeys();
+      redraw = true;
+      return redraw; 
+    }
+
     if (upPressed()) {
       settingsMenu = settingsMenu == 0 ? 3 : settingsMenu - 1;
       redraw = true;
@@ -1655,76 +1588,70 @@ bool handleInput() {
       redraw = true;
     }
 
+    // Use leftPressed()/rightPressed() directly (they already do edge detection)
     bool left = leftPressed();
     bool right = rightPressed();
 
     if (left || right) {
+      const bool isRight = right;
+      const int dir = isRight ? 1 : -1;
+
       if (settingsMenu == 0) {
-        int dir = right ? 1 : -1;
         uint8_t next = irTxPin;
 
         for (uint8_t tries = 0; tries <= MAX_GPIO; ++tries) {
           next = (uint8_t)(((int)next + dir + MAX_GPIO + 1) % (MAX_GPIO + 1));
-
           if (next != irRxPin) {
             break;
           }
         }
 
-        irTxPin = next;
-        applyPins();
-        saveSettings();
-        redraw = true;
+        if (next != irTxPin) {
+          irTxPin = next;
+          applyPins();
+          redraw = true;
+        }
 
       } else if (settingsMenu == 1) {
-        int dir = right ? 1 : -1;
         uint8_t next = irRxPin;
 
         for (uint8_t tries = 0; tries <= MAX_GPIO; ++tries) {
           next = (uint8_t)(((int)next + dir + MAX_GPIO + 1) % (MAX_GPIO + 1));
-
           if (next != irTxPin) {
             break;
           }
         }
 
-        irRxPin = next;
-        applyPins();
-        saveSettings();
-        redraw = true;
+        if (next != irRxPin) {
+          irRxPin = next;
+          applyPins();
+          redraw = true;
+        }
 
       } else if (settingsMenu == 2) {
-        int value = (int)screenBrightness + (right ? BRIGHTNESS_STEP : -BRIGHTNESS_STEP);
-
+        int value = (int)screenBrightness + (isRight ? BRIGHTNESS_STEP : -BRIGHTNESS_STEP);
         screenBrightness = (uint8_t)constrain(
           value,
           (int)MIN_BRIGHTNESS,
-          (int)MAX_BRIGHTNESS);
+          (int)MAX_BRIGHTNESS
+        );
 
         if (!screenDimmed) {
           M5Cardputer.Display.setBrightness(screenBrightness);
         }
 
-        saveSettings();
         redraw = true;
 
       } else if (settingsMenu == 3) {
-        int value = (int)dimIndex + (right ? 1 : -1);
-
+        int value = (int)dimIndex + (isRight ? 1 : -1);
         dimIndex = (uint8_t)constrain(
           value,
           0,
-          (int)DIM_CHOICE_COUNT - 1);
+          (int)DIM_CHOICE_COUNT - 1
+        );
 
-        saveSettings();
         redraw = true;
       }
-    }
-
-    if (back || enterPressed()) {
-      screen = HOME;
-      syncKeys();
-      redraw = true;
     }
   }
 
@@ -1760,7 +1687,7 @@ bool handleInput() {
 }
 
 // Copies the splash sprite pixel-by-pixel, skipping any pixel that matches
-// splashAlpha (the magic "transparent" color the PNG was exported with).
+
 
 void showSplash() {
   canvas.fillSprite(0x0000);  // black background behind the transparent areas
