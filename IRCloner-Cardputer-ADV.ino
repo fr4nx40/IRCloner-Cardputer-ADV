@@ -13,7 +13,7 @@
 // IR Cloner - stable single-file Cardputer build
 // Libraries: M5Cardputer, IRremote
 // TX/RX pins are configurable at runtime from the SETTINGS screen (persisted in NVS)
-// Keys: ;=up  .=down  ,=left  /=right  Enter=select  `=back  S=save  R=replay  D=delete file
+// Keys: ;=up  .=down  ,=left  /=right  Enter=select  `=back  S=save  R=replay  D=delete file  Fn+S=screenshot
 
 
 enum Screen : uint8_t {
@@ -73,6 +73,7 @@ uint8_t editIndex = 0;
 String editText;
 String files[32];
 uint8_t fileCount = 0;
+uint8_t reviewTop = 0;   // first visible row of the REVIEW (rename) list's scroll window
 String messageTitle;
 String messageDetail;
 
@@ -122,7 +123,11 @@ bool wasEnter = false;
 bool wasSave = false;
 bool wasReplay = false;
 bool wasDelete = false;
+bool wasScreenshot = false;
 std::vector<char> previousWord;
+
+// --- Screenshot capture (Fn+S) ---
+uint16_t screenshotCounter = 0;
 
 // Needed when this single-file sketch is built as C++ (for example, by
 // PlatformIO) rather than through Arduino IDE's automatic prototype pass.
@@ -161,6 +166,12 @@ bool replayPressed() {
 bool deletePressed() {
   return keyEdge(M5Cardputer.Keyboard.isKeyPressed(DELETE_KEY), wasDelete);
 }
+// Fn+S, checked separately from the plain 's' used by savePressed() so the
+// two don't both fire off the same physical keypress - see its use in loop().
+bool screenshotPressed() {
+  bool held = M5Cardputer.Keyboard.keysState().fn && M5Cardputer.Keyboard.isKeyPressed('s');
+  return keyEdge(held, wasScreenshot);
+}
 
 void syncKeys() {
   wasUp = M5Cardputer.Keyboard.isKeyPressed(';');
@@ -172,6 +183,7 @@ void syncKeys() {
   wasSave = M5Cardputer.Keyboard.isKeyPressed('s');
   wasReplay = M5Cardputer.Keyboard.isKeyPressed('r');
   wasDelete = M5Cardputer.Keyboard.isKeyPressed(DELETE_KEY);
+  wasScreenshot = M5Cardputer.Keyboard.keysState().fn && M5Cardputer.Keyboard.isKeyPressed('s');
 }
 
 bool menuWrap(uint8_t &index, uint8_t count) {
@@ -737,29 +749,39 @@ void drawList(const String &title, const String items[], uint8_t count,
   footer(footerText);
 }
 
+// Shared scroll-window math for any "selected row in a list longer than the
+// screen" case. Keeps `currentTop` so that `selectedIndex` stays within the
+// next `visibleCount` rows: scroll up as soon as the selection goes above the
+// window, scroll down as soon as it goes below, and never scroll past the
+// end of the list. The file browser and the REVIEW (rename) list both use
+// this - previously only the browser had it, which is why REVIEW only ever
+// showed its first few rows and scrolling further did nothing.
+uint8_t clampScrollTop(uint8_t selectedIndex, uint8_t total, uint8_t currentTop, uint8_t visibleCount) {
+  if (total == 0) return 0;
+
+  uint8_t top = currentTop;
+  if (selectedIndex < top) {
+    top = selectedIndex;
+  }
+  if (selectedIndex >= (uint16_t)top + visibleCount) {
+    top = selectedIndex - visibleCount + 1;
+  }
+
+  uint8_t maxTop = total > visibleCount ? total - visibleCount : 0;
+  if (top > maxTop) {
+    top = maxTop;
+  }
+  return top;
+}
+
 void keepBrowserSelectionVisible() {
   constexpr uint8_t VISIBLE_FILES = 4;
+  browserTop = clampScrollTop(menu, fileCount, browserTop, VISIBLE_FILES);
+}
 
-  if (fileCount == 0) {
-    browserTop = 0;
-    return;
-  }
-
-  if (menu < browserTop) {
-    browserTop = menu;
-  }
-
-  if (menu >= browserTop + VISIBLE_FILES) {
-    browserTop = menu - VISIBLE_FILES + 1;
-  }
-
-  uint8_t maxTop = fileCount > VISIBLE_FILES
-                     ? fileCount - VISIBLE_FILES
-                     : 0;
-
-  if (browserTop > maxTop) {
-    browserTop = maxTop;
-  }
+void keepReviewSelectionVisible() {
+  constexpr uint8_t VISIBLE_BUTTONS = 5;
+  reviewTop = clampScrollTop(selected, workRemote.count, reviewTop, VISIBLE_BUTTONS);
 }
 
 void drawScreen() {
@@ -781,10 +803,26 @@ void drawScreen() {
   }
 
   else if (screen == REVIEW) {
-    String items[5];
-    uint8_t shown = min(workRemote.count, (uint8_t)5);
-    for (uint8_t i = 0; i < shown; ++i) items[i] = String(i + 1) + ". " + workRemote.signals[i].name;
-    drawList("REVIEW REMOTE", items, shown, selected, "[ENTER] Name [R] Replay [S] Save");
+    header("REVIEW REMOTE");
+
+    keepReviewSelectionVisible();
+
+    constexpr uint8_t VISIBLE_BUTTONS = 5;
+    uint8_t shown = min((uint8_t)(workRemote.count - reviewTop), VISIBLE_BUTTONS);
+
+    for (uint8_t row = 0; row < shown; ++row) {
+      uint8_t buttonIndex = reviewTop + row;
+      int y = 41 + row * 14;
+      bool active = buttonIndex == selected;
+
+      String label = String(buttonIndex + 1) + ". " + workRemote.signals[buttonIndex].name;
+
+      if (active) canvas.fillRoundRect(10, y, 220, 12, 2, UI_CYAN);
+      canvas.setTextColor(active ? UI_BG : UI_WHITE, active ? UI_CYAN : UI_BG);
+      canvas.drawString(String(active ? "> " : "  ") + label, 19, y + 2);
+    }
+
+    footer("[ENTER] Name [R] Replay [S] Save");
   }
 
   else if (screen == EDIT_BUTTON || screen == EDIT_REMOTE) {
@@ -1254,6 +1292,7 @@ bool handleInput() {
     }
     if (savePressed() && workRemote.count) {
       selected = 0;
+      reviewTop = 0;
       screen = REVIEW;
       syncKeys();
       redraw = true;
@@ -1266,7 +1305,11 @@ bool handleInput() {
   }
 
   else if (screen == REVIEW) {
-    redraw |= menuWrap(selected, workRemote.count);
+    bool movedSelection = menuWrap(selected, workRemote.count);
+    if (movedSelection) {
+      keepReviewSelectionVisible();
+      redraw = true;
+    }
     if (replayPressed() && workRemote.count) {
       sendSignal(workRemote.signals[selected]);
       redraw = true;
@@ -1686,6 +1729,62 @@ bool handleInput() {
   return redraw;
 }
 
+// Writes the current canvas straight out as an uncompressed 24-bit BMP to
+// <IR_DIR>/screenshots, on SD if it's mounted, LittleFS otherwise. Uses the
+// canvas's own readRectRGB() to fetch each row, rather than reading
+// canvas.getBuffer()'s raw RGB565 and unpacking it by hand. Despite its
+// name, LGFXBase::readRectRGB(uint8_t*) writes bytes in R,G,B order per
+// pixel (confirmed against LovyanGFX's bgr888_t struct, whose fields are
+// declared r,g,b) - a BMP needs B,G,R, so each pixel's R and B bytes are
+// swapped below before writing. Stored top-down (negative height in the
+// header), so no bottom-to-top row-flip loop is needed either.
+bool saveScreenshotBMP() {
+  FS *fs = sdOK ? static_cast<FS *>(&SD) : (littlefsOK ? static_cast<FS *>(&LittleFS) : nullptr);
+  if (!fs) return false;
+
+  String dir = String(IR_DIR) + "/screenshots";
+  if (!fs->exists(dir) && !fs->mkdir(dir)) return false;
+
+  const int width = 240;
+  const int height = 135;
+  const uint32_t rowBytes = width * 3;  // 720 - already a multiple of 4, so no row padding needed
+  const uint32_t pixelDataSize = rowBytes * height;
+  const uint32_t fileSize = 54 + pixelDataSize;
+
+  uint8_t header[54] = {0};
+  header[0] = 'B'; header[1] = 'M';
+  memcpy(&header[2], &fileSize, 4);
+  uint32_t dataOffset = 54;
+  memcpy(&header[10], &dataOffset, 4);
+  uint32_t dibSize = 40;
+  memcpy(&header[14], &dibSize, 4);
+  int32_t w = width, h = -height;  // negative height = stored top-down
+  memcpy(&header[18], &w, 4);
+  memcpy(&header[22], &h, 4);
+  header[26] = 1;   // planes
+  header[28] = 24;  // bits per pixel
+  memcpy(&header[34], &pixelDataSize, 4);
+
+  String path = dir + "/screenshot_" + String(millis()) + "_" + String(screenshotCounter++) + ".bmp";
+  File f = fs->open(path, FILE_WRITE);
+  if (!f) return false;
+  f.write(header, sizeof(header));
+
+  uint8_t row[width * 3];
+  for (int y = 0; y < height; ++y) {
+    canvas.readRectRGB(0, y, width, 1, row);  // R,G,B order per pixel
+    for (int x = 0; x < width; ++x) {
+      uint8_t *px = row + x * 3;
+      uint8_t r = px[0];
+      px[0] = px[2];  // B
+      px[2] = r;      // R  (px[1]=G is already correct)
+    }
+    f.write(row, sizeof(row));
+  }
+  f.close();
+  return true;
+}
+
 // Copies the splash sprite pixel-by-pixel, skipping any pixel that matches
 
 
@@ -1740,6 +1839,19 @@ void setup() {
 void loop() {
   M5Cardputer.update();
 
+  // Fn+S is handled before anything else, from any screen, so it works as a
+  // global "grab a screenshot" shortcut. It also pre-marks the plain 's' key
+  // as already held, so the per-screen savePressed() check (CAPTURE_REMOTE,
+  // REVIEW, ...) doesn't also fire for the same physical keypress once Fn is
+  // released while 's' is still down.
+  if (screenshotPressed()) {
+    wasSave = M5Cardputer.Keyboard.isKeyPressed('s');
+    bool ok = saveScreenshotBMP();
+    showMessage(ok ? "SCREENSHOT SAVED" : "SCREENSHOT FAILED");
+    drawScreen();
+    delay(12);
+    return;
+  }
 
   bool irTestChanged = updateIrSelfTest();
 
