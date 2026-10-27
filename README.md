@@ -46,9 +46,15 @@ You can change the TX and RX pins from the app's Settings screen.
 
 ![Menu screen](media/images/menu.jpg)
 
-![Capture screen](media/images/capture.jpg)
+![Capture screen](media/images/pre-capture.jpg)
+
+![Capture screen](media/images/capture-remote.jpg)
 
 ![Remote screen](media/images/remote.jpg)
+
+![Settings screen](media/images/spam-settings.jpg)
+
+![Settings screen](media/images/spam-signals.jpg)
 
 ![Settings screen](media/images/settings.jpg)
 
@@ -112,11 +118,12 @@ Example filename:
 | `.` | Down |
 | `,` | Left |
 | `/` | Right |
-| Enter | Select / Confirm |
+| `Enter` | Select / Confirm |
 | `` ` `` | Back |
 | `S` | Save |
 | `R` | Replay |
 | `D` | Delete |
+| `fn`+`s` | Take Screenshot |
 
 ## Known limitations
 
