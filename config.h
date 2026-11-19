@@ -4,7 +4,7 @@
 #include <cstdint>
 
 // App version
-constexpr const char *APP_VERSION = "v1.1.0";
+constexpr const char *APP_VERSION = "v1.2.0";
 
 // Storage paths
 constexpr const char *IR_DIR = "/ircloner";
