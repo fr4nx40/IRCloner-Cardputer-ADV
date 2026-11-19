@@ -14,6 +14,11 @@
 // Libraries: M5Cardputer, IRremote
 // TX/RX pins are configurable at runtime from the SETTINGS screen (persisted in NVS)
 // Keys: ;=up  .=down  ,=left  /=right  Enter=select  `=back  S=save  R=replay  D=delete file  Fn+S=screenshot
+// Hotkeys: a button can carry a hotkey, saved in the .ir file as a comment line under its name:
+//   name: Power
+//   # hotkey: ENT
+// Remotes with at least one hotkey open in the compact key list (press a key to send, TAB = next page).
+// Remotes with none open in the original button grid. ESC, DEL and TAB can never be hotkeys.
 
 
 enum Screen : uint8_t {
@@ -26,6 +31,7 @@ enum Screen : uint8_t {
   LOAD_WHERE,
   BROWSER,
   REMOTE_GRID,
+  REMOTE_LIST,
   SPAM_BROWSER,
   SPAM_SETUP,
   SPAM_RUNNING,
@@ -48,12 +54,15 @@ struct Signal {
   bool isRaw = false;
   uint32_t frequency = 38000;     // Hz, from the .ir "frequency:" field
   std::vector<uint32_t> rawData;  // microsecond mark/space durations
+  String hotkey;                  // "" = none, else ENT UP DN LT RT SPC or one of A-Z 0-9
+  bool hotkeyAuto = false;        // true = handed out automatically on load, never written back
 };
 
 struct Remote {
   String name;
   Signal signals[MAX_SIGNALS];
   uint8_t count = 0;
+  bool hasHotkeys = false;  // at least one explicit hotkey: open in the compact list instead of the grid
 };
 
 M5Canvas canvas(&M5Cardputer.Display);
@@ -71,6 +80,25 @@ uint8_t selected = 0;
 uint8_t gridIndex = 0;
 uint8_t editIndex = 0;
 String editText;
+
+// --- Hotkeys / compact remote list / marquee ---
+constexpr uint8_t LIST_PAGE_SIZE = 21;  // compact list: 3 columns x 7 rows
+constexpr uint16_t UI_GREY = 0x8C71;    // hints and automatically assigned keys
+uint8_t listPage = 0;
+uint8_t flashIndex = 255;               // button that was just sent (drawn cyan briefly)
+uint32_t flashUntil = 0;
+uint8_t editField = 0;                  // EDIT_BUTTON: 0 = name, 1 = hotkey
+bool hotkeyCapture = false;             // waiting for the key to assign
+int8_t hotkeyConflict = -1;             // index of the button already using pendingKey
+String editHotkey;
+String pendingKey;
+bool editingSaved = false;             // REVIEW/EDIT_* are editing a remote loaded from storage
+Store editStore = STORE_SD;             // where that remote lives
+String editPath;                        // its file, so saving overwrites it in place
+String editOrigName;                    // its name when loaded (a rename saves a new file)
+bool keysChanged = false;               // Keyboard.isChange() answered once per loop() pass (it is stateful)
+bool marqueeActive = false;             // set by drawMarquee() while something is scrolling
+uint32_t marqueeEpoch = 0;              // scrolling restarts from the left when this is reset
 String files[32];
 uint8_t fileCount = 0;
 uint8_t reviewTop = 0;   // first visible row of the REVIEW (rename) list's scroll window
@@ -123,8 +151,11 @@ bool wasEnter = false;
 bool wasSave = false;
 bool wasReplay = false;
 bool wasDelete = false;
+bool wasEdit = false;
 bool wasScreenshot = false;
+bool wasTab = false;
 std::vector<char> previousWord;
+std::vector<char> previousHotkeys;  // physical (unshifted) keys held, for hotkey capture
 
 // --- Screenshot capture (Fn+S) ---
 uint16_t screenshotCounter = 0;
@@ -163,6 +194,9 @@ bool savePressed() {
 bool replayPressed() {
   return keyEdge(M5Cardputer.Keyboard.isKeyPressed('r'), wasReplay);
 }
+bool editPressed() {
+  return keyEdge(M5Cardputer.Keyboard.isKeyPressed('e'), wasEdit);
+}
 bool deletePressed() {
   return keyEdge(M5Cardputer.Keyboard.isKeyPressed(DELETE_KEY), wasDelete);
 }
@@ -171,6 +205,9 @@ bool deletePressed() {
 bool screenshotPressed() {
   bool held = M5Cardputer.Keyboard.keysState().fn && M5Cardputer.Keyboard.isKeyPressed('s');
   return keyEdge(held, wasScreenshot);
+}
+bool tabPressed() {
+  return keyEdge(M5Cardputer.Keyboard.keysState().tab, wasTab);
 }
 
 void syncKeys() {
@@ -183,7 +220,10 @@ void syncKeys() {
   wasSave = M5Cardputer.Keyboard.isKeyPressed('s');
   wasReplay = M5Cardputer.Keyboard.isKeyPressed('r');
   wasDelete = M5Cardputer.Keyboard.isKeyPressed(DELETE_KEY);
+  wasEdit = M5Cardputer.Keyboard.isKeyPressed('e');
   wasScreenshot = M5Cardputer.Keyboard.keysState().fn && M5Cardputer.Keyboard.isKeyPressed('s');
+  wasTab = M5Cardputer.Keyboard.keysState().tab;
+  marqueeEpoch = millis();  // every screen change restarts any scrolling text
 }
 
 bool menuWrap(uint8_t &index, uint8_t count) {
@@ -200,9 +240,9 @@ bool menuWrap(uint8_t &index, uint8_t count) {
 }
 
 bool textInput(String &value, size_t maxLength) {
-  if (!M5Cardputer.Keyboard.isChange()) return false;
+  if (!keysChanged) return false;
   if (!M5Cardputer.Keyboard.isPressed()) {
-    previousWord.clear();
+    previousWord.clear(); previousHotkeys.clear();
     return false;
   }
 
@@ -299,6 +339,179 @@ String valueOf(const String &line) {
   return value;
 }
 
+// --- Hotkeys ---------------------------------------------------------------
+// A hotkey is stored as a short canonical name: ENT UP DN LT RT SPC, or a single
+// A-Z / 0-9. UP / DN / LT / RT are the ; . , / keys (the Cardputer's arrow keys).
+// ESC (`), DEL and TAB are reserved and can never be hotkeys.
+
+// Every key that can be a hotkey, by its plain (unshifted) label. ` is Esc and is
+// reserved; Tab, Del, Fn, Shift, Ctrl, Alt and Opt are not in this list either.
+const char HOTKEY_KEYS[] = "1234567890-=qwertyuiop[]\\asdfghjkl;'zxcvbnm,./ ";
+
+bool isHotkeyKey(char c) {
+  return c != 0 && strchr(HOTKEY_KEYS, c) != nullptr;
+}
+
+// Accepts what a person might type into an .ir file by hand (case-insensitive)
+// and returns the canonical name, or "" if it isn't a usable hotkey. Shifted
+// symbols are accepted as the key they sit on (+ means the = key, { the [ key).
+String normaliseHotkey(String text) {
+  text.trim();
+  text.toUpperCase();
+  if (text == "ENTER" || text == "RETURN" || text == "ENT") return "ENT";
+  if (text == "UP" || text == ";") return "UP";
+  if (text == "DOWN" || text == "DN" || text == ".") return "DN";
+  if (text == "LEFT" || text == "LT" || text == ",") return "LT";
+  if (text == "RIGHT" || text == "RT" || text == "/") return "RT";
+  if (text == "SPACE" || text == "SPC") return "SPC";
+  if (text.length() != 1) return "";
+  char c = text[0];
+  switch (c) {
+    case '+': c = '='; break;
+    case '_': c = '-'; break;
+    case '{': c = '['; break;
+    case '}': c = ']'; break;
+    case '|': c = '\\'; break;
+    case '"': c = '\''; break;
+    default: break;
+  }
+  if (c == ' ' || !isHotkeyKey((char)tolower((unsigned char)c))) return "";
+  return String(c);
+}
+
+String hotkeyLongName(const String &key) {
+  if (key == "ENT") return "ENTER";
+  if (key == "DN") return "DOWN";
+  if (key == "LT") return "LEFT";
+  if (key == "RT") return "RIGHT";
+  if (key == "SPC") return "SPACE";
+  return key;
+}
+
+// Maps a physical key (its plain, unshifted character) to its hotkey name
+// ("" = not usable as a hotkey).
+String keyNameFromChar(char c) {
+  switch (c) {
+    case ';': return "UP";
+    case '.': return "DN";
+    case ',': return "LT";
+    case '/': return "RT";
+    case ' ': return "SPC";
+    default: break;
+  }
+  char lower = (char)tolower((unsigned char)c);
+  if (!isHotkeyKey(lower)) return "";
+  if (isalpha((unsigned char)lower)) return String((char)toupper((unsigned char)lower));
+  return String(lower);
+}
+
+// The keys currently held, as the plain character printed on each key. This reads
+// the key positions, so Shift, Aa (caps) and Fn do not change what a key means:
+// 1 stays "1" instead of turning into "!", [ stays "[" instead of "{".
+std::vector<char> physicalKeys() {
+  std::vector<char> keys;
+  for (const auto &pos : M5Cardputer.Keyboard.keyList()) {
+    char c = M5Cardputer.Keyboard.getKeyValue(pos).value_first;
+    if (isHotkeyKey(c)) keys.push_back(c);
+  }
+  return keys;
+}
+
+// Returns the hotkey name of a key that has just been pressed, or "" if nothing
+// new was pressed. Fires once per physical press (held keys don't repeat).
+// While Fn is held only ; . , / count (they are the arrow keys), and every other
+// key is still remembered as held, so Fn+S can't fire an S hotkey on release.
+String newHotkeyPress() {
+  if (enterPressed()) return "ENT";
+  if (!keysChanged) return "";
+  if (!M5Cardputer.Keyboard.isPressed()) {
+    previousWord.clear(); previousHotkeys.clear();
+    return "";
+  }
+
+  bool fn = M5Cardputer.Keyboard.keysState().fn;
+  std::vector<char> now = physicalKeys();
+  String result;
+  for (char c : now) {
+    bool alreadyHeld = std::find(previousHotkeys.begin(), previousHotkeys.end(), c) != previousHotkeys.end();
+    if (alreadyHeld || result.length()) continue;
+    if (fn && !strchr(";.,/", c)) continue;
+    result = keyNameFromChar(c);
+  }
+  previousHotkeys = now;
+  return result;
+}
+
+// Run after a remote is loaded. Explicit hotkeys win (the first button keeps a
+// key that two buttons claim). If the remote has any explicit hotkey, every
+// button that still has none is handed an automatic one (1-9, 0, then unused
+// letters) so nothing becomes unreachable. A remote with no explicit hotkeys
+// is left alone and opens in the original grid.
+void finalizeHotkeys(Remote &remote) {
+  remote.hasHotkeys = false;
+  for (uint8_t i = 0; i < remote.count; ++i) {
+    Signal &s = remote.signals[i];
+    s.hotkeyAuto = false;
+    if (!s.hotkey.length()) continue;
+    bool duplicate = false;
+    for (uint8_t j = 0; j < i; ++j) {
+      if (remote.signals[j].hotkey == s.hotkey) duplicate = true;
+    }
+    if (duplicate) s.hotkey = "";
+    else remote.hasHotkeys = true;
+  }
+  if (!remote.hasHotkeys) return;
+
+  const char *pool = "1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  for (uint8_t i = 0; i < remote.count; ++i) {
+    Signal &s = remote.signals[i];
+    if (s.hotkey.length()) continue;
+    for (const char *p = pool; *p; ++p) {
+      String candidate = String(*p);
+      bool used = false;
+      for (uint8_t j = 0; j < remote.count; ++j) {
+        if (remote.signals[j].hotkey == candidate) used = true;
+      }
+      if (!used) {
+        s.hotkey = candidate;
+        s.hotkeyAuto = true;
+        break;
+      }
+    }
+  }
+}
+
+// More protocols IRremote can decode and send with an address and a command.
+// They are listed by name so a signal keeps working when it is saved and reloaded.
+// All of these exist in IRremote 4.3 through 5.x, and IrSender.write() knows how to
+// send each of them. (Left out on purpose: BANG_OLUFSEN, which write() cannot send,
+// MAGIQUEST, whose 32-bit ID does not fit an address, and LEGO_PF and WHYNTER.)
+struct ExtraProtocol {
+  const char *name;
+  decode_type_t type;
+};
+const ExtraProtocol EXTRA_PROTOCOLS[] = {
+  {"APPLE", APPLE},
+  {"DENON", DENON},
+  {"SHARP", SHARP},
+  {"SAMSUNG48", SAMSUNG48},
+  {"KASEIKYO_DENON", KASEIKYO_DENON},
+  {"KASEIKYO_SHARP", KASEIKYO_SHARP},
+  {"KASEIKYO_JVC", KASEIKYO_JVC},
+  {"KASEIKYO_MITSUBISHI", KASEIKYO_MITSUBISHI},
+  {"BOSEWAVE", BOSEWAVE},
+  {"FAST", FAST},
+};
+
+// Index into EXTRA_PROTOCOLS, or -1. (Returns an int, not a pointer to ExtraProtocol: the Arduino IDE
+// puts generated function prototypes above this struct, where that type is not known yet.)
+int extraProtocolIndex(const String &name) {
+  for (size_t i = 0; i < sizeof(EXTRA_PROTOCOLS) / sizeof(EXTRA_PROTOCOLS[0]); ++i) {
+    if (name == EXTRA_PROTOCOLS[i].name) return (int)i;
+  }
+  return -1;
+}
+
 String protocolName(decode_type_t type) {
   switch (type) {
     case NEC: return "NEC";
@@ -313,19 +526,142 @@ String protocolName(decode_type_t type) {
     case RC5: return "RC5";
     case RC6: return "RC6";
     case ONKYO: return "ONKYO";
-    default: return "";
+    default: break;
   }
+  for (const ExtraProtocol &x : EXTRA_PROTOCOLS) {
+    if (x.type == type) return x.name;
+  }
+  return "";
+}
+
+// ---- Raw capture -------------------------------------------------------------
+// A frame IRremote cannot turn into a protocol + address + command (the Dyson fan
+// remotes, many air conditioners, ...) is recorded as raw mark/space timings instead,
+// the same thing a Flipper stores as "type: raw". Many of these remotes send the same
+// frame twice about 100 ms apart, so after the first frame we wait briefly for a second
+// matching one and store both, with the measured gap between them.
+constexpr uint32_t RAW_SECOND_FRAME_WAIT_MS = 250;   // how long to wait for a second frame
+constexpr uint32_t RAW_REPEAT_SUPPRESS_MS = 600;     // a held button keeps sending: ignore those
+constexpr uint32_t RAW_GAP_MIN_US = 10000;           // a second frame must follow after 10 ms ...
+constexpr uint32_t RAW_GAP_MAX_US = 400000;          // ... to 400 ms
+constexpr size_t RAW_MIN_ENTRIES = 12;               // shorter bursts are treated as noise
+
+std::vector<uint32_t> rawPending;      // frame(s) waiting for a possible second frame
+uint32_t rawPendingAt = 0;
+uint8_t rawPendingFrames = 0;
+size_t rawFirstFrameLength = 0;        // entries in the first frame (before any gap + second frame)
+std::vector<uint32_t> lastRawFrame;    // first frame of the last delivered capture
+uint32_t lastRawSeenAt = 0;
+
+void resetRawCapture() {
+  rawPending.clear();
+  rawPendingFrames = 0;
+  rawFirstFrameLength = 0;
+  lastRawFrame.clear();
+  lastRawSeenAt = 0;
+}
+
+// Two frames count as the same when every mark and space is within 25 % (+100 us).
+bool framesSimilar(const std::vector<uint32_t> &a, const std::vector<uint32_t> &b, size_t bLength) {
+  if (a.size() != bLength) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    uint32_t hi = std::max(a[i], b[i]);
+    uint32_t lo = std::min(a[i], b[i]);
+    if (hi - lo > hi / 4 + 100) return false;
+  }
+  return true;
+}
+
+// Reads the frame IRremote just received as microsecond marks and spaces (first value is a
+// mark). Must run before IrReceiver.resume(), which lets the next frame overwrite the buffer.
+// Returns the gap before this frame (time since the previous frame ended) in microseconds.
+uint32_t readRawFrame(std::vector<uint32_t> &frame) {
+  frame.clear();
+  uint32_t rawlen = IrReceiver.irparams.rawlen;
+  for (uint32_t i = 1; i < rawlen; ++i) {            // entry 0 is not part of the frame
+    uint32_t us = (uint32_t)IrReceiver.irparams.rawbuf[i] * MICROS_PER_TICK;
+    if (i & 1) us = us > MARK_EXCESS_MICROS ? us - MARK_EXCESS_MICROS : us;   // marks are stretched by the receiver
+    else us += MARK_EXCESS_MICROS;                                          // spaces are shortened
+    frame.push_back(us);
+  }
+#if defined(VERSION_IRREMOTE_MAJOR) && ((VERSION_IRREMOTE_MAJOR > 4) || (VERSION_IRREMOTE_MAJOR == 4 && VERSION_IRREMOTE_MINOR >= 4))
+  return (uint32_t)IrReceiver.irparams.initialGapTicks * MICROS_PER_TICK;
+#else
+  return (uint32_t)IrReceiver.irparams.rawbuf[0] * MICROS_PER_TICK;   // IRremote 4.3 keeps the gap in entry 0
+#endif
+}
+
+bool finishRawCapture(Signal &signal, uint32_t now) {
+  signal = Signal();
+  signal.isRaw = true;
+  signal.frequency = 38000;
+  signal.rawData = rawPending;
+  lastRawFrame.assign(rawPending.begin(), rawPending.begin() + rawFirstFrameLength);
+  lastRawSeenAt = now;
+  rawPending.clear();
+  rawPendingFrames = 0;
+  rawFirstFrameLength = 0;
+  return true;
+}
+
+// Called with every frame that has no protocol. Returns true when a finished raw capture is ready.
+bool handleRawFrame(const std::vector<uint32_t> &frame, uint32_t gapUs, Signal &signal) {
+  if (frame.size() < RAW_MIN_ENTRIES) return false;
+  uint32_t now = millis();
+
+  // The button is still held (or the remote repeats): not a new press.
+  if (lastRawFrame.size() && now - lastRawSeenAt < RAW_REPEAT_SUPPRESS_MS &&
+      framesSimilar(frame, lastRawFrame, lastRawFrame.size())) {
+    lastRawSeenAt = now;
+    return false;
+  }
+
+  if (rawPending.size()) {
+    bool second = rawPendingFrames == 1 && gapUs >= RAW_GAP_MIN_US && gapUs <= RAW_GAP_MAX_US &&
+                  framesSimilar(frame, rawPending, rawFirstFrameLength);
+    if (second) {
+      rawPending.push_back(gapUs);                   // the gap is a space between the two frames
+      rawPending.insert(rawPending.end(), frame.begin(), frame.end());
+      rawPendingFrames = 2;
+      return finishRawCapture(signal, now);
+    }
+    // A different frame arrived: hand over the waiting one and start on the new one.
+    bool ready = finishRawCapture(signal, now);
+    rawPending = frame;
+    rawPendingAt = now;
+    rawPendingFrames = 1;
+    rawFirstFrameLength = frame.size();
+    return ready;
+  }
+
+  rawPending = frame;
+  rawPendingAt = now;
+  rawPendingFrames = 1;
+  rawFirstFrameLength = frame.size();
+  return false;
 }
 
 bool captureSignal(Signal &signal) {
+  // A raw frame is waiting and no second frame came: that was the whole signal.
+  if (rawPending.size() && millis() - rawPendingAt >= RAW_SECOND_FRAME_WAIT_MS) {
+    return finishRawCapture(signal, millis());
+  }
+
   if (!IrReceiver.decode()) return false;
 
   auto &data = IrReceiver.decodedIRData;
   bool repeat = data.flags & IRDATA_FLAGS_IS_REPEAT;
   bool overflow = data.flags & IRDATA_FLAGS_WAS_OVERFLOW;
   String protocol = protocolName(data.protocol);
+
+  // No usable protocol: record it as raw timings (read before resume() frees the buffer).
+  std::vector<uint32_t> rawFrame;
+  uint32_t gapUs = 0;
+  bool isRawFrame = !protocol.length() && !repeat && !overflow;
+  if (isRawFrame) gapUs = readRawFrame(rawFrame);
   IrReceiver.resume();
 
+  if (isRawFrame) return handleRawFrame(rawFrame, gapUs, signal);
   if (repeat || overflow || !protocol.length()) return false;
 
   uint32_t now = millis();
@@ -385,7 +721,19 @@ bool sendSignal(const Signal &signal) {
   else if (p == "PANASONIC" || p == "KASEIKYO") IrSender.sendPanasonic((uint16_t)signal.address, (uint16_t)signal.command, 0);
   else if (p == "RC5") IrSender.sendRC5((uint8_t)signal.address, (uint8_t)signal.command, 0);
   else if (p == "RC6") IrSender.sendRC6((uint8_t)signal.address, (uint8_t)signal.command, 0);
-  else return false;
+  else {
+    // The extra protocols go through IRremote's generic sender.
+    int extraIndex = extraProtocolIndex(p);
+    if (extraIndex < 0) return false;
+    const ExtraProtocol *extra = &EXTRA_PROTOCOLS[extraIndex];
+    IRData data;
+    memset(&data, 0, sizeof(data));
+    data.protocol = extra->type;
+    data.address = (uint16_t)signal.address;
+    data.command = (uint16_t)signal.command;
+    data.numberOfBits = signal.bits;
+    return IrSender.write(&data, 0) != 0;
+  }
   return true;
 }
 
@@ -393,7 +741,7 @@ void resetRemote(Remote &remote) {
   remote = Remote();
 }
 
-bool saveRemote(Store store, const Remote &remote, String &error) {
+bool saveRemote(Store store, const Remote &remote, String &error, const String &pathOverride = "") {
   FS *fs = fsFor(store);
   if (!fs) {
     error = "STORAGE NOT READY";
@@ -408,7 +756,7 @@ bool saveRemote(Store store, const Remote &remote, String &error) {
     return false;
   }
 
-  File file = fs->open(String(IR_DIR) + "/" + filenameFor(remote.name) + ".ir", FILE_WRITE);
+  File file = fs->open(pathOverride.length() ? pathOverride : String(IR_DIR) + "/" + filenameFor(remote.name) + ".ir", FILE_WRITE);
   if (!file) {
     error = "OPEN FAILED";
     return false;
@@ -424,6 +772,7 @@ bool saveRemote(Store store, const Remote &remote, String &error) {
     const Signal &s = remote.signals[i];
     file.println("#");
     file.printf("name: %s\n", s.name.c_str());
+    if (s.hotkey.length() && !s.hotkeyAuto) file.printf("# hotkey: %s\n", s.hotkey.c_str());
     if (s.isRaw) {
       file.println("type: raw");
       file.printf("frequency: %lu\n", (unsigned long)s.frequency);
@@ -480,13 +829,15 @@ bool loadRemote(Store store, const String &path, Remote &remote, String &error) 
 
     if (line.startsWith("Filetype:")) {
       headerOK = valueOf(line).equalsIgnoreCase("IR signals file");
-    } else if (line.startsWith("# ") && !active && !remote.name.length()) {
+    } else if (line.startsWith("# ") && !active && !remote.name.length() && !line.startsWith("# hotkey:")) {
       remote.name = cleanName(line.substring(2));
     } else if (line.startsWith("name:")) {
       commit();
       current = Signal();
       active = true;
       current.name = cleanName(valueOf(line));
+    } else if (active && (line.startsWith("# hotkey:") || line.startsWith("hotkey:"))) {
+      current.hotkey = normaliseHotkey(valueOf(line));
     } else if (active && line.startsWith("type:")) {
       String t = valueOf(line);
       t.toLowerCase();
@@ -517,6 +868,7 @@ bool loadRemote(Store store, const String &path, Remote &remote, String &error) 
     return false;
   }
   if (!remote.name.length()) remote.name = "REMOTE";
+  finalizeHotkeys(remote);
   return true;
 }
 
@@ -666,12 +1018,45 @@ void saveSettings() {
   saveSettingsToSD();
 }
 
+// Draws text inside a box maxW pixels wide. If it fits it is drawn normally
+// (centred in the box if `center`). If it is too long it scrolls right-to-left
+// and loops, pausing briefly at the start. Uses the current text size. The text
+// restarts from the left whenever marqueeEpoch is reset (see syncKeys()).
+void drawMarquee(const String &text, int x, int y, int maxW,
+                 uint16_t fg, uint16_t bg, bool center) {
+  canvas.setTextColor(fg, bg);
+  int w = canvas.textWidth(text);
+  canvas.setClipRect(x, y, maxW, canvas.fontHeight());
+  if (w <= maxW) {
+    canvas.setTextDatum(center ? top_center : top_left);
+    canvas.drawString(text, center ? x + maxW / 2 : x, y);
+  } else {
+    marqueeActive = true;
+    const int GAP = 24;         // blank pixels between the end and the repeat
+    const uint32_t PAUSE_MS = 1000;
+    const uint32_t PX_PER_SEC = 30;
+    uint32_t period = (uint32_t)(w + GAP) * 1000 / PX_PER_SEC + PAUSE_MS;
+    uint32_t t = (millis() - marqueeEpoch) % period;
+    int offset = t < PAUSE_MS ? 0 : (int)((t - PAUSE_MS) * PX_PER_SEC / 1000);
+    canvas.setTextDatum(top_left);
+    canvas.drawString(text, x - offset, y);
+    canvas.drawString(text, x - offset + w + GAP, y);  // the wrap-around copy
+  }
+  canvas.clearClipRect();
+  canvas.setTextDatum(top_left);
+}
+
+// Static version for rows that are not in focus: cut to fit and add "..".
+String fitText(String s, int maxW) {
+  if (canvas.textWidth(s) <= maxW) return s;
+  while (s.length() > 1 && canvas.textWidth(s + "..") > maxW) s.remove(s.length() - 1);
+  return s + "..";
+}
+
 void header(const String &title) {
   canvas.fillScreen(UI_BG);
-  canvas.setTextDatum(top_center);
   canvas.setTextSize(2);
-  canvas.setTextColor(UI_PINK, UI_BG);
-  canvas.drawString(title, 120, 10);
+  drawMarquee(title, 6, 10, 228, UI_PINK, UI_BG, true);  // long remote names scroll
   canvas.drawFastHLine(6, 32, 228, UI_YELLOW);
   canvas.setTextDatum(top_left);
   canvas.setTextSize(1);
@@ -785,6 +1170,8 @@ void keepReviewSelectionVisible() {
 }
 
 void drawScreen() {
+  marqueeActive = false;
+
   if (screen == HOME) {
     const String items[] = { "CAPTURE REMOTE", "REMOTES", "SPAM SIGNALS", "SETTINGS", "SYSTEM", "ABOUT" };
     drawList("IR CLONER", items, 6, menu, "[ENTER] Select");
@@ -803,7 +1190,7 @@ void drawScreen() {
   }
 
   else if (screen == REVIEW) {
-    header("REVIEW REMOTE");
+    header(editingSaved ? "EDIT REMOTE" : "REVIEW REMOTE");
 
     keepReviewSelectionVisible();
 
@@ -816,17 +1203,80 @@ void drawScreen() {
       bool active = buttonIndex == selected;
 
       String label = String(buttonIndex + 1) + ". " + workRemote.signals[buttonIndex].name;
+      String hk = workRemote.signals[buttonIndex].hotkey;
+      int hkWidth = hk.length() ? canvas.textWidth(hk) + 8 : 0;
 
       if (active) canvas.fillRoundRect(10, y, 220, 12, 2, UI_CYAN);
       canvas.setTextColor(active ? UI_BG : UI_WHITE, active ? UI_CYAN : UI_BG);
-      canvas.drawString(String(active ? "> " : "  ") + label, 19, y + 2);
+      canvas.drawString(fitText(String(active ? "> " : "  ") + label, 207 - hkWidth), 19, y + 2);
+      if (hk.length()) {
+        canvas.setTextDatum(top_right);
+        canvas.setTextColor(active ? UI_BG : UI_YELLOW, active ? UI_CYAN : UI_BG);
+        canvas.drawString(hk, 225, y + 2);
+        canvas.setTextDatum(top_left);
+      }
     }
 
     footer("[ENTER] Name [R] Replay [S] Save");
   }
 
-  else if (screen == EDIT_BUTTON || screen == EDIT_REMOTE) {
-    header(screen == EDIT_BUTTON ? "NAME BUTTON" : "SAVE REMOTE");
+  else if (screen == EDIT_BUTTON) {
+    header("NAME BUTTON");
+    bool nameFocus = editField == 0;
+
+    canvas.setTextColor(UI_WHITE, UI_BG);
+    canvas.drawString("NAME", 12, 36);
+    canvas.drawRoundRect(10, 46, 220, 18, 2, nameFocus ? UI_CYAN : UI_DIM);
+    canvas.setTextColor(nameFocus ? UI_YELLOW : UI_WHITE, UI_BG);
+    canvas.drawString("> " + editText + (nameFocus ? "_" : ""), 16, 51);
+
+    canvas.setTextColor(UI_WHITE, UI_BG);
+    canvas.drawString("HOTKEY", 12, 69);
+    uint16_t keyBorder = hotkeyConflict >= 0 ? UI_RED
+                         : hotkeyCapture     ? UI_PINK
+                         : !nameFocus        ? UI_CYAN
+                                             : UI_DIM;
+    canvas.drawRoundRect(10, 79, 220, 18, 2, keyBorder);
+
+    String keyText;
+    uint16_t keyColor = UI_YELLOW;
+    if (hotkeyConflict >= 0) {
+      keyText = hotkeyLongName(pendingKey);
+    } else if (hotkeyCapture) {
+      keyText = "PRESS A KEY...";
+    } else if (editHotkey.length()) {
+      keyText = hotkeyLongName(editHotkey);
+      keyColor = nameFocus ? UI_WHITE : UI_YELLOW;
+    } else {
+      keyText = "NONE";
+      keyColor = UI_GREY;
+    }
+    canvas.setTextColor(keyColor, UI_BG);
+    canvas.drawString(keyText, 16, 84);
+
+    String hint;
+    uint16_t hintColor = UI_GREY;
+    if (hotkeyConflict >= 0) {
+      hint = hotkeyLongName(pendingKey) + " IS ALREADY USED BY " + workRemote.signals[hotkeyConflict].name;
+      hintColor = UI_RED;
+    } else if (hotkeyCapture) {
+      hint = "ANY KEY EXCEPT ESC / TAB / DEL";
+    } else {
+      hint = "ESC / TAB / DEL CAN'T BE HOTKEYS";
+    }
+    canvas.setTextDatum(top_center);
+    canvas.setTextColor(hintColor, UI_BG);
+    canvas.drawString(fitText(hint, 228), 120, 102);
+    canvas.setTextDatum(top_left);
+
+    if (hotkeyConflict >= 0) footer("[ENTER] Reassign  [ESC] Cancel");
+    else if (hotkeyCapture) footer("[DEL] No hotkey  [ESC] Cancel");
+    else if (nameFocus) footer("[ENTER] Hotkey [TAB] Skip [ESC] Cancel");
+    else footer("[ENTER] Save [DEL] Clear [TAB] Name");
+  }
+
+  else if (screen == EDIT_REMOTE) {
+    header("SAVE REMOTE");
     canvas.setTextColor(UI_WHITE, UI_BG);
     canvas.drawString("TYPE NAME:", 12, 48);
     canvas.drawRoundRect(10, 63, 220, 22, 2, UI_CYAN);
@@ -881,27 +1331,30 @@ void drawScreen() {
           name.remove(name.length() - 3);
         }
 
-        // Leave room for the selection arrow and avoid overflowing.
-        if (name.length() > 25) {
-          name = name.substring(0, 25);
-        }
-
         if (active) {
           canvas.fillRoundRect(10, y, 220, 12, 2, UI_CYAN);
         }
 
+        // The selected row scrolls if the name is too long; the others are
+        // cut with "..".
+        String prefix = active ? "> " : "  ";
+        int textX = 19 + canvas.textWidth(prefix);
+        int maxW = 226 - textX;
+
         canvas.setTextColor(
           active ? UI_BG : UI_WHITE,
           active ? UI_CYAN : UI_BG);
-
-        canvas.drawString(
-          String(active ? "> " : "  ") + name,
-          19,
-          y + 2);
+        canvas.drawString(prefix, 19, y + 2);
+        if (active) {
+          drawMarquee(name, textX, y + 2, maxW, UI_BG, UI_CYAN, false);
+        } else {
+          canvas.drawString(fitText(name, maxW), textX, y + 2);
+        }
       }
 
 
-      footer("[ENTER] Load [D] Delete [ESC] Back");
+      footer(screen == BROWSER ? "[ENTER] Load [E] Edit [D] Delete"
+                                : "[ENTER] Load [D] Delete [ESC] Back");
     }
   }
 
@@ -966,12 +1419,61 @@ void drawScreen() {
     footer("[ENTER] Send [ESC] Back");
   }
 
+  else if (screen == REMOTE_LIST) {
+    header(loadedRemote.name);
+    canvas.setTextSize(1);
+    canvas.setTextDatum(top_left);
+
+    uint16_t count = loadedRemote.count;
+    uint8_t pages = (count + LIST_PAGE_SIZE - 1) / LIST_PAGE_SIZE;
+    if (listPage >= pages) listPage = 0;
+    uint16_t pageStart = (uint16_t)listPage * LIST_PAGE_SIZE;
+
+    for (uint8_t slot = 0; slot < LIST_PAGE_SIZE; ++slot) {
+      uint16_t index = pageStart + slot;
+      if (index >= count) break;
+      const Signal &s = loadedRemote.signals[index];
+
+      int x = 6 + (slot % 3) * 76;
+      int y = 40 + (slot / 3) * 10;
+      bool flash = index == flashIndex;
+
+      // Yellow = a hotkey somebody set, grey = handed out automatically or none.
+      String key = s.hotkey.length() ? s.hotkey : String("--");
+      uint16_t keyColor = flash ? UI_CYAN : ((s.hotkeyAuto || !s.hotkey.length()) ? UI_GREY : UI_YELLOW);
+      int keyWidth = canvas.textWidth(key);
+
+      // 12 characters per column: key + "-" + name.
+      int maxName = 12 - (int)key.length() - 1;
+      String name = s.name;
+      if ((int)name.length() > maxName) name = name.substring(0, maxName - 1) + ".";
+
+      canvas.setTextColor(keyColor, UI_BG);
+      canvas.drawString(key, x, y);
+      canvas.setTextColor(flash ? UI_CYAN : UI_PINK, UI_BG);
+      canvas.drawString("-", x + keyWidth, y);
+      canvas.setTextColor(flash ? UI_CYAN : UI_WHITE, UI_BG);
+      canvas.drawString(name, x + keyWidth + 6, y);
+    }
+
+    // Footer: page range in yellow, then the key hints.
+    String pageText = String(pageStart + 1) + "-" + String(min((int)pageStart + LIST_PAGE_SIZE, (int)count)) + " / " + String(count);
+    String rest = pages > 1 ? "  [TAB] Next  [ESC] Back" : "  [ESC] Back";
+    int startX = 120 - canvas.textWidth(pageText + rest) / 2;
+    canvas.drawFastHLine(6, 115, 228, UI_YELLOW);
+    canvas.setTextColor(UI_YELLOW, UI_BG);
+    canvas.drawString(pageText, startX, 121);
+    canvas.setTextColor(UI_WHITE, UI_BG);
+    canvas.drawString(rest, startX + canvas.textWidth(pageText), 121);
+  }
+
   else if (screen == SPAM_SETUP) {
     header("SPAM SETTINGS");
 
     String target = spamTarget == 0
                       ? "ALL SIGNALS"
                       : loadedRemote.signals[spamTarget - 1].name;
+    target = fitText(target, 140);  // keep a long button name clear of the "SEND:" label
 
     String modeStr = spamContinuous ? "CONTINUOUS" : "COUNTED";
 
@@ -1223,8 +1725,13 @@ void showMessage(const String &title, const String &detail = "") {
 
 void openEditor(bool button) {
   editText = button ? workRemote.signals[editIndex].name : workRemote.name;
+  editHotkey = "";
+  if (button) editHotkey = workRemote.signals[editIndex].hotkey;
+  editField = 0;
+  hotkeyCapture = false;
+  hotkeyConflict = -1;
   screen = button ? EDIT_BUTTON : EDIT_REMOTE;
-  previousWord.clear();
+  previousWord.clear(); previousHotkeys.clear();
   syncKeys();
 }
 
@@ -1251,10 +1758,12 @@ bool handleInput() {
 
       if (choice == 0) {
         resetRemote(workRemote);
+        editingSaved = false;
         lastCapturedProtocol = "";
         lastCapturedAddress = 0;
         lastCapturedCommand = 0;
         lastCapturedAt = 0;
+        resetRawCapture();
         screen = CAPTURE_REMOTE;
 
       } else if (choice == 1) {
@@ -1324,13 +1833,110 @@ bool handleInput() {
       redraw = true;
     }
     if (back) {
-      screen = CAPTURE_REMOTE;
+      // Editing a saved remote: Esc drops the changes and goes back to the file list.
+      screen = editingSaved ? BROWSER : CAPTURE_REMOTE;
+      editingSaved = false;
       syncKeys();
       redraw = true;
     }
   }
 
-  else if (screen == EDIT_BUTTON || screen == EDIT_REMOTE) {
+  else if (screen == EDIT_BUTTON) {
+    bool tab = tabPressed();
+    bool delPress = keysChanged && M5Cardputer.Keyboard.isPressed() &&
+                    M5Cardputer.Keyboard.keysState().del;
+
+    if (hotkeyCapture) {
+      if (back) {
+        // ESC abandons the capture (the old hotkey is kept).
+        hotkeyCapture = false;
+        hotkeyConflict = -1;
+        syncKeys();
+        redraw = true;
+      } else if (hotkeyConflict >= 0) {
+        // The key already belongs to another button: ENTER takes it over.
+        if (enterPressed()) {
+          workRemote.signals[hotkeyConflict].hotkey = "";
+          editHotkey = pendingKey;
+          hotkeyConflict = -1;
+          hotkeyCapture = false;
+          editField = 1;   // stay on the hotkey field: the next ENTER saves
+          syncKeys();
+          redraw = true;
+        }
+      } else if (delPress) {
+        // DEL = no hotkey for this button.
+        editHotkey = "";
+        hotkeyCapture = false;
+        editField = 1;
+        redraw = true;
+      } else {
+        String key = newHotkeyPress();
+        if (key.length()) {
+          int8_t other = -1;
+          for (uint8_t i = 0; i < workRemote.count; ++i) {
+            if (i != editIndex && workRemote.signals[i].hotkey == key) {
+              other = (int8_t)i;
+              break;
+            }
+          }
+          if (other >= 0) {
+            pendingKey = key;
+            hotkeyConflict = other;
+          } else {
+            editHotkey = key;
+            hotkeyCapture = false;
+            editField = 1;   // stay on the hotkey field: the next ENTER saves
+          }
+          redraw = true;
+        }
+      }
+    } else if (back) {
+      screen = REVIEW;
+      syncKeys();
+      redraw = true;
+    } else if (tab) {
+      editField = editField ? 0 : 1;
+      previousWord.clear(); previousHotkeys.clear();
+      redraw = true;
+    } else if (editField == 0) {
+      redraw |= textInput(editText, 24);
+      if (enterPressed()) {
+        // NAME, then ENTER: go straight to the hotkey and wait for a key press.
+        String cleaned = cleanName(editText);
+        if (!cleaned.length()) {
+          editText = cleaned;
+          showMessage("NAME REQUIRED");
+        } else {
+          editText = cleaned;
+          editField = 1;
+          hotkeyCapture = true;
+          previousWord.clear(); previousHotkeys.clear();
+        }
+        redraw = true;
+      }
+    } else {
+      // Hotkey field, nothing pending: ENTER saves the button and returns to the list.
+      if (enterPressed()) {
+        String cleaned = cleanName(editText);
+        if (!cleaned.length()) {
+          editField = 0;
+          showMessage("NAME REQUIRED");
+        } else {
+          workRemote.signals[editIndex].name = cleaned;
+          workRemote.signals[editIndex].hotkey = editHotkey;
+          screen = REVIEW;
+          syncKeys();
+        }
+        redraw = true;
+      } else if (delPress) {
+        editHotkey = "";
+        redraw = true;
+      }
+    }
+  }
+
+  else if (screen == EDIT_REMOTE) {
     redraw |= textInput(editText, 24);
     if (back) {
       screen = REVIEW;
@@ -1340,15 +1946,26 @@ bool handleInput() {
       editText = cleanName(editText);
       if (!editText.length()) {
         showMessage("NAME REQUIRED");
-      } else if (screen == EDIT_BUTTON) {
-        workRemote.signals[editIndex].name = editText;
-        screen = REVIEW;
-        syncKeys();
       } else {
         workRemote.name = editText;
-        menu = 0;
-        screen = SAVE_WHERE;
-        syncKeys();
+        if (editingSaved) {
+          // Saved remote: overwrite its own file. Renaming it writes a new file instead.
+          String error;
+          bool renamed = workRemote.name != editOrigName;
+          if (saveRemote(editStore, workRemote, error, renamed ? String("") : editPath)) {
+            editingSaved = false;
+            scanFiles(editStore);
+            if (menu >= fileCount) menu = fileCount ? fileCount - 1 : 0;
+            screen = BROWSER;
+            showMessage("REMOTE SAVED", storeName(editStore));
+          } else {
+            showMessage("SAVE FAILED", error);
+          }
+        } else {
+          menu = 0;
+          screen = SAVE_WHERE;
+          syncKeys();
+        }
       }
       redraw = true;
     }
@@ -1399,6 +2016,28 @@ bool handleInput() {
       screen = CONFIRM_DELETE;
       syncKeys();
       redraw = true;
+    } else if (!spam && editPressed() && fileCount) {
+      // E: open the saved remote in the editor (rename buttons, set or change hotkeys).
+      String error;
+      if (loadRemote(activeStore, files[menu], workRemote, error)) {
+        for (uint8_t i = 0; i < workRemote.count; ++i) {
+          if (workRemote.signals[i].hotkeyAuto) {   // automatic keys are never saved
+            workRemote.signals[i].hotkey = "";
+            workRemote.signals[i].hotkeyAuto = false;
+          }
+        }
+        editingSaved = true;
+        editStore = activeStore;
+        editPath = files[menu];
+        editOrigName = workRemote.name;
+        selected = 0;
+        reviewTop = 0;
+        screen = REVIEW;
+        syncKeys();
+      } else {
+        showMessage("LOAD FAILED", error);
+      }
+      redraw = true;
     } else if (back) {
       menu = 0;
       screen = HOME;
@@ -1414,7 +2053,11 @@ bool handleInput() {
           screen = SPAM_SETUP;
         } else {
           gridIndex = 0;
-          screen = REMOTE_GRID;
+          listPage = 0;
+          flashIndex = 255;
+          previousWord.clear(); previousHotkeys.clear();
+          // Remotes with hotkeys open in the compact key list, the rest in the grid.
+          screen = loadedRemote.hasHotkeys ? REMOTE_LIST : REMOTE_GRID;
         }
         syncKeys();
       } else {
@@ -1471,8 +2114,42 @@ bool handleInput() {
       if (!sendSignal(loadedRemote.signals[gridIndex])) showMessage("SEND FAILED");
       redraw = true;
     }
-    if (canvas.textWidth(loadedRemote.name) > 224) {
+  }
+
+  else if (screen == REMOTE_LIST) {
+    uint16_t count = loadedRemote.count;
+    uint8_t pages = (count + LIST_PAGE_SIZE - 1) / LIST_PAGE_SIZE;
+    bool tab = tabPressed();
+
+    if (back) {
+      screen = BROWSER;
+      syncKeys();
       redraw = true;
+    } else {
+      if (tab && pages > 1) {
+        listPage = (listPage + 1) % pages;
+        redraw = true;
+      }
+
+      // A hotkey sends its button straight away, even from another page.
+      String key = newHotkeyPress();
+      if (key.length()) {
+        for (uint8_t i = 0; i < count; ++i) {
+          if (loadedRemote.signals[i].hotkey == key) {
+            listPage = i / LIST_PAGE_SIZE;
+            flashIndex = i;
+            flashUntil = millis() + 250;
+            if (!sendSignal(loadedRemote.signals[i])) showMessage("SEND FAILED");
+            redraw = true;
+            break;
+          }
+        }
+      }
+
+      if (flashIndex != 255 && millis() > flashUntil) {
+        flashIndex = 255;
+        redraw = true;
+      }
     }
   }
 
@@ -1839,6 +2516,11 @@ void setup() {
 void loop() {
   M5Cardputer.update();
 
+  // Keyboard.isChange() remembers the last key count, so a second call in the same
+  // pass would return false. Ask exactly once here; textInput(), the hotkey code and
+  // the edit screen all read keysChanged instead of calling isChange() themselves.
+  keysChanged = M5Cardputer.Keyboard.isChange();
+
   // Fn+S is handled before anything else, from any screen, so it works as a
   // global "grab a screenshot" shortcut. It also pre-marks the plain 's' key
   // as already held, so the per-screen savePressed() check (CAPTURE_REMOTE,
@@ -1846,6 +2528,8 @@ void loop() {
   // released while 's' is still down.
   if (screenshotPressed()) {
     wasSave = M5Cardputer.Keyboard.isKeyPressed('s');
+    previousWord = M5Cardputer.Keyboard.keysState().word;
+    previousHotkeys = physicalKeys();  // 's' must not also fire as a hotkey
     bool ok = saveScreenshotBMP();
     showMessage(ok ? "SCREENSHOT SAVED" : "SCREENSHOT FAILED");
     drawScreen();
@@ -1869,6 +2553,13 @@ void loop() {
 
   bool redraw = handleInput();
 
-  if (redraw || irTestChanged || (screen == SYSTEM && irTestActive)) drawScreen();
+  // Keep animating while a long name is scrolling (about 20 frames a second).
+  static uint32_t lastMarqueeDraw = 0;
+  if (marqueeActive && millis() - lastMarqueeDraw >= 50) redraw = true;
+
+  if (redraw || irTestChanged || (screen == SYSTEM && irTestActive)) {
+    drawScreen();
+    lastMarqueeDraw = millis();
+  }
   delay(12);
 }
